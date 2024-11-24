@@ -8,7 +8,7 @@ An implementation of the OpenAI 'Grokking: Generalization Beyond Overfitting on 
 
 * Clone the repo and cd into it:
     ```bash
-    git clone https://github.com/danielmamay/grokking.git
+    git clone https://github.com/drzsdrtfg/grokking.git
     cd grokking
     ```
 * Use Python 3.9 or later:
