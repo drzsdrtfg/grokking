@@ -24,8 +24,8 @@ def main(args: dict):
     wandb.define_metric("cumulative_flops")
     wandb.define_metric("training/accuracy", step_metric='step')
     wandb.define_metric("training/loss", step_metric='cumulative_flops')
-    wandb.define_metric("validation/accuracy", step_metric='epoch')
-    wandb.define_metric("validation/loss", step_metric='epoch')
+    wandb.define_metric("validation/accuracy", step_metric='cumulative_flops')
+    wandb.define_metric("validation/loss", step_metric='cumulative_flops')
     
     train_loader, val_loader = get_data(
         config.operation,
@@ -45,8 +45,17 @@ def main(args: dict):
     
     # Profile the model to get FLOPs per step
     sample_input = torch.randint(0, config.prime + 2, (config.batch_size, 4)).to(device)
-    flops, _ = profile(model, inputs=(sample_input,))
-    flops_per_step = 2 * flops  # Account for both forward and backward passes
+    try:
+        flops, _ = profile(model, inputs=(sample_input,))
+        flops_per_step = 2 * flops  # Account for both forward and backward passes
+    except Exception as e:
+        print(f"Error calculating FLOPs: {e}")
+        # Fallback to manual estimation
+        n = 4
+        d = config.dim_model
+        flops_per_layer = 2 * n**2 * d + 2 * n * d**2
+        total_flops = flops_per_layer * config.num_layers
+        flops_per_step = 2 * total_flops
     cumulative_flops = 0
     
     optimizer = torch.optim.AdamW(
@@ -64,7 +73,7 @@ def main(args: dict):
     
     for epoch in tqdm(range(num_epochs)):
         cumulative_flops = train_epoch(model, train_loader, optimizer, scheduler, scaler, device, config.num_steps, epoch, flops_per_step, cumulative_flops)
-        evaluate(model, val_loader, device, epoch)
+        evaluate(model, val_loader, device, epoch, cumulative_flops)
 
 
 def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, num_steps, epoch, flops_per_step, cumulative_flops):
@@ -108,7 +117,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, num_s
     return cumulative_flops  # Ensure cumulative_flops is returned even if the loop doesn't break
 
 
-def evaluate(model, val_loader, device, epoch):
+def evaluate(model, val_loader, device, epoch, cumulative_flops):
     model.eval()
     criterion = torch.nn.CrossEntropyLoss()
     
@@ -132,10 +141,12 @@ def evaluate(model, val_loader, device, epoch):
     avg_loss = total_loss / total
     accuracy = correct / total
     
+    # Log validation metrics with cumulative_flops
     metrics = {
         "validation/accuracy": accuracy,
         "validation/loss": avg_loss,
-        "epoch": epoch
+        "epoch": epoch,
+        "cumulative_flops": cumulative_flops
     }
     wandb.log(metrics)
     
