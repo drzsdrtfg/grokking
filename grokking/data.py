@@ -1,6 +1,10 @@
 from math import ceil
 import torch
 
+# Token constants
+BOS_TOKEN = -1  # Beginning of sequence token
+EOS_TOKEN = -2  # End of sequence token
+
 DIVISION_MODULO_OPERATIONS = {
     "x/y": lambda x, y, p: (x*y % p, y, x),
 }
@@ -22,9 +26,7 @@ ALL_OPERATIONS = {
 
 def operation_mod_p_data(operation: str, p: int, eq_token: int, op_token: int):
     """
-    Generate data for modular arithmetic operations
-    x◦y (mod p) for 0 <= x < p, 1 <= y < p if operation in DIVISION_MODULO_OPERATIONS
-    x◦y (mod p) for 0 <= x, y < p otherwise
+    Generate data for modular arithmetic operations with BOS and EOS tokens
     """
     x = torch.arange(0, p)
     y = torch.arange(0 if operation not in DIVISION_MODULO_OPERATIONS else 1, p)
@@ -32,10 +34,15 @@ def operation_mod_p_data(operation: str, p: int, eq_token: int, op_token: int):
 
     eq = torch.ones_like(x) * eq_token
     op = torch.ones_like(x) * op_token
+    
+    # Add BOS and EOS tokens
+    bos = torch.ones_like(x) * (p + 2)  # BOS token
+    eos = torch.ones_like(x) * (p + 3)  # EOS token
 
     x, y, labels = ALL_OPERATIONS[operation](x, y, p)
 
-    inputs = torch.stack([x, op, y, eq], dim=1)
+    # Stack with BOS at start and EOS at end
+    inputs = torch.stack([bos, x, op, y, eq, eos], dim=1)
 
     return inputs, labels
 
