@@ -4,7 +4,10 @@ from tqdm import tqdm
 import wandb
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
-from data import get_data, ALL_OPERATIONS, DIVISION_MODULO_OPERATIONS
+import os
+import json
+import random
+from data import get_data, get_tinystories_data, ALL_OPERATIONS, DIVISION_MODULO_OPERATIONS
 from model import Transformer
 from thop import profile
 
@@ -52,13 +55,70 @@ def inference_demo(model, prime, device, operation="x*y", num_examples=5):
         print(f"Correct: {predictions[i].item() == actual_results[i]}")
         print("-" * 50)
 
-def main(args: dict):
+def generate_text(model, vocab, device, seed_text="", max_len=100, temperature=0.8):
+    """Generate text using the trained model"""
+    model.eval()
+    
+    # Create inverse vocabulary (id -> char)
+    id_to_char = {v: k for k, v in vocab.items()}
+    
+    # Convert seed text to token IDs
+    tokens = [vocab.get(char, vocab['<pad>']) for char in seed_text]
+    
+    # Add BOS token
+    tokens = [vocab['<bos>']] + tokens
+    
+    # Create input tensor
+    input_sequence = torch.tensor([tokens], device=device)
+    
+    # Generate text
+    generated = seed_text
+    
+    for _ in range(max_len):
+        # Keep only the last tokens that fit in the model's context
+        if input_sequence.size(1) > model.position_embeddings.weight.size(0):
+            input_sequence = input_sequence[:, -model.position_embeddings.weight.size(0):]
+        
+        # Forward pass
+        with torch.no_grad():
+            output = model(input_sequence)
+            # Get logits for the next token
+            next_token_logits = output[-1, -1, :]
+            
+            # Apply temperature scaling
+            next_token_logits = next_token_logits / temperature
+            
+            # Apply softmax to get probabilities
+            probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
+            
+            # Sample from the distribution
+            next_token = torch.multinomial(probs, 1).item()
+            
+            # Stop if EOS token is generated
+            if next_token == vocab['<eos>'] or next_token == vocab['<pad>']:
+                break
+                
+            # Add to the sequence
+            input_sequence = torch.cat(
+                [input_sequence, torch.tensor([[next_token]], device=device)], dim=1
+            )
+            
+            # Add the character to the generated text
+            if next_token in id_to_char:
+                char = id_to_char[next_token]
+                if char not in ['<bos>', '<eos>', '<pad>']:
+                    generated += char
+    
+    return generated
+
+def main(args):
     wandb.init(project="grokking-study", config=args)
     config = wandb.config
     device = torch.device(config.device)
     
     torch.manual_seed(42)
     np.random.seed(42)
+    random.seed(42)
     
     wandb.define_metric("step")
     wandb.define_metric("epoch")
@@ -68,34 +128,69 @@ def main(args: dict):
     wandb.define_metric("validation/accuracy", step_metric='cumulative_flops')
     wandb.define_metric("validation/loss", step_metric='cumulative_flops')
     
-    train_loader, val_loader = get_data(
-        config.operation,
-        config.prime,
-        config.training_fraction,
-        config.batch_size
-    )
+    # Load data based on mode
+    if config.mode == "arithmetic":
+        train_loader, val_loader = get_data(
+            config.operation,
+            config.prime,
+            config.training_fraction,
+            config.batch_size
+        )
+        num_tokens = config.prime + 4  # Include special tokens
+        seq_len = 6
+        vocab = None
+    else:  # tinystories
+        train_loader, val_loader, vocab = get_tinystories_data(
+            config.data_path,
+            config.seq_len,
+            config.batch_size,
+            config.training_fraction
+        )
+        num_tokens = len(vocab)
+        seq_len = config.seq_len
     
     model = Transformer(
         num_layers=config.num_layers,
         dim_model=config.dim_model,
         num_heads=config.num_heads,
-        num_tokens=config.prime + 2,
-        seq_len=6,
+        num_tokens=num_tokens,
+        seq_len=seq_len,
         dropout=0.1
     ).to(device)
 
+    # Handle inference-only mode
     if args.inference_only and args.model_path:
         model.load_state_dict(torch.load(args.model_path))
-        inference_demo(model, config.prime, device, config.operation)
+        
+        if config.mode == "arithmetic":
+            inference_demo(model, config.prime, device, config.operation)
+        else:  # tinystories
+            # Load vocabulary
+            vocab_path = args.model_path.replace(".pt", "_vocab.json")
+            if os.path.exists(vocab_path):
+                with open(vocab_path, 'r') as f:
+                    vocab = json.load(f)
+            
+            # Generate text samples
+            print("\nGenerated Text Samples:")
+            print("-" * 50)
+            seeds = ["Once upon a time", "There was a", "The little", "In a small town"]
+            for seed in seeds:
+                print(f"Seed: {seed}")
+                text = generate_text(model, vocab, device, seed_text=seed, max_len=200)
+                print(f"Generated: {text}")
+                print("-" * 50)
+        
         return
 
-    sample_input = torch.randint(0, config.prime + 4, (config.batch_size, 6)).to(device)
+    # Estimate FLOPs
+    sample_input = torch.randint(0, num_tokens, (config.batch_size, seq_len)).to(device)
     try:
         flops, _ = profile(model, inputs=(sample_input,))
         flops_per_step = 2 * flops
     except Exception as e:
         print(f"Error calculating FLOPs: {e}")
-        n = 6
+        n = seq_len
         d = config.dim_model
         flops_per_layer = 2 * n**2 * d + 2 * n * d**2
         total_flops = flops_per_layer * config.num_layers
@@ -117,32 +212,84 @@ def main(args: dict):
     num_epochs = ceil(config.num_steps / len(train_loader))
     
     for epoch in tqdm(range(num_epochs)):
-        cumulative_flops = train_epoch(model, train_loader, optimizer, scheduler, 
-                                     scaler, device, config.num_steps, epoch, 
-                                     flops_per_step, cumulative_flops)
-        evaluate(model, val_loader, device, epoch, cumulative_flops)
+        cumulative_flops = train_epoch(
+            model, train_loader, optimizer, scheduler, 
+            scaler, device, config.num_steps, epoch, 
+            flops_per_step, cumulative_flops, config.mode
+        )
+        evaluate(model, val_loader, device, epoch, cumulative_flops, config.mode)
     
-    print("\nRunning inference demo...")
-    inference_demo(model, config.prime, device, config.operation)
-    
-    model_path = f"model_{config.operation}_{config.prime}.pt"
-    torch.save(model.state_dict(), model_path)
-    print(f"\nModel saved to {model_path}")
+    # Save model and perform inference demo
+    if config.mode == "arithmetic":
+        model_path = f"model_{config.operation}_{config.prime}.pt"
+        torch.save(model.state_dict(), model_path)
+        print(f"\nModel saved to {model_path}")
+        
+        print("\nRunning inference demo...")
+        inference_demo(model, config.prime, device, config.operation)
+    else:  # tinystories
+        model_path = f"model_tinystories_{config.seq_len}.pt"
+        torch.save(model.state_dict(), model_path)
+        
+        # Save vocabulary
+        vocab_path = f"model_tinystories_{config.seq_len}_vocab.json"
+        with open(vocab_path, 'w') as f:
+            json.dump(vocab, f)
+        
+        print(f"\nModel saved to {model_path}")
+        print(f"Vocabulary saved to {vocab_path}")
+        
+        # Generate text samples
+        print("\nGenerated Text Samples:")
+        print("-" * 50)
+        seeds = ["Once upon a time", "There was a", "The little", "In a small town"]
+        for seed in seeds:
+            print(f"Seed: {seed}")
+            text = generate_text(model, vocab, device, seed_text=seed, max_len=200)
+            print(f"Generated: {text}")
+            print("-" * 50)
 
 def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, 
-                num_steps, epoch, flops_per_step, cumulative_flops):
+                num_steps, epoch, flops_per_step, cumulative_flops, mode="arithmetic"):
     model.train()
     criterion = torch.nn.CrossEntropyLoss()
     
     for batch_idx, batch in enumerate(train_loader):
         batch = tuple(t.to(device) for t in batch)
-        inputs, labels = batch
+        inputs, targets = batch
         
         optimizer.zero_grad(set_to_none=True)
         
         with autocast():
-            output = model(inputs)[-1,:,:]
-            loss = criterion(output, labels)
+            outputs = model(inputs)
+            
+            if mode == "arithmetic":
+                # For arithmetic, predict final answer only
+                output = outputs[-1,:,:]
+                loss = criterion(output, targets)
+                with torch.no_grad():
+                    acc = (torch.argmax(output, dim=1) == targets).float().mean()
+            else:  # tinystories
+                # For text, we need to align the predictions with targets
+                # First, reshape targets
+                batch_size, seq_len = targets.shape
+                
+                # Reshape outputs to [batch_size, seq_len, vocab_size]
+                outputs = outputs.permute(1, 0, 2)
+                
+                # We only need positions 0 to seq_len-1 from outputs to predict positions 1 to seq_len in targets
+                outputs = outputs[:, :-1, :]  # [batch_size, seq_len-1, vocab_size]
+                targets = targets[:, 1:]      # [batch_size, seq_len-1]
+                
+                # Flatten for loss calculation
+                outputs_flat = outputs.reshape(-1, outputs.size(-1))  # [(batch_size * (seq_len-1)), vocab_size]
+                targets_flat = targets.reshape(-1)                    # [(batch_size * (seq_len-1))]
+                
+                loss = criterion(outputs_flat, targets_flat)
+                
+                with torch.no_grad():
+                    preds = torch.argmax(outputs_flat, dim=1)
+                    acc = (preds == targets_flat).float().mean()
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -150,9 +297,6 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device,
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
-        
-        with torch.no_grad():
-            acc = (torch.argmax(output, dim=1) == labels).float().mean()
         
         cumulative_flops += flops_per_step
         metrics = {
@@ -170,7 +314,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device,
     
     return cumulative_flops
 
-def evaluate(model, val_loader, device, epoch, cumulative_flops):
+def evaluate(model, val_loader, device, epoch, cumulative_flops, mode="arithmetic"):
     model.eval()
     criterion = torch.nn.CrossEntropyLoss()
     
@@ -181,17 +325,42 @@ def evaluate(model, val_loader, device, epoch, cumulative_flops):
     with torch.no_grad():
         for batch in val_loader:
             batch = tuple(t.to(device) for t in batch)
-            inputs, labels = batch
+            inputs, targets = batch
             
-            outputs = model(inputs)[-1,:,:]
-            loss = criterion(outputs, labels)
+            outputs = model(inputs)
+            
+            if mode == "arithmetic":
+                # For arithmetic, predict final answer only
+                output = outputs[-1,:,:]
+                loss = criterion(output, targets)
+                pred = torch.argmax(output, dim=1)
+                correct += (pred == targets).sum().item()
+                total += targets.size(0)
+            else:  # tinystories
+                # Use same approach as training
+                batch_size, seq_len = targets.shape
+                
+                # Reshape outputs 
+                outputs = outputs.permute(1, 0, 2)
+                
+                # Align outputs and targets
+                outputs = outputs[:, :-1, :]  # [batch_size, seq_len-1, vocab_size]
+                targets = targets[:, 1:]      # [batch_size, seq_len-1]
+                
+                # Flatten 
+                outputs_flat = outputs.reshape(-1, outputs.size(-1))
+                targets_flat = targets.reshape(-1)
+                
+                loss = criterion(outputs_flat, targets_flat)
+                
+                # Calculate accuracy
+                pred = torch.argmax(outputs_flat, dim=1)
+                correct += (pred == targets_flat).sum().item()
+                total += targets_flat.size(0)
             
             total_loss += loss.item() * inputs.size(0)
-            pred = outputs.argmax(dim=1)
-            correct += (pred == labels).sum().item()
-            total += inputs.size(0)
     
-    avg_loss = total_loss / total
+    avg_loss = total_loss / len(val_loader)
     accuracy = correct / total
     
     metrics = {
