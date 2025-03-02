@@ -7,7 +7,6 @@ import numpy as np
 import os
 import json
 import random
-import time
 from data import get_data, get_tinystories_data, ALL_OPERATIONS, DIVISION_MODULO_OPERATIONS
 from model import Transformer
 from thop import profile
@@ -112,139 +111,59 @@ def generate_text(model, vocab, device, seed_text="", max_len=100, temperature=0
     
     return generated
 
-def log_text_samples(model, vocab, device, seed_texts, wandb_run, step, prefix="sample"):
-    """Generate and log text samples to WandB"""
-    samples = {}
-    
-    # Generate samples from each seed text
-    for i, seed in enumerate(seed_texts):
-        generated_text = generate_text(model, vocab, device, seed_text=seed, max_len=200)
-        samples[f"{prefix}_{i+1}"] = f"Seed: '{seed}'\n\n{generated_text}"
-    
-    # Log to wandb
-    wandb_run.log({"text_samples": samples}, step=step)
-    
-    return samples
-
-def calculate_perplexity(loss):
-    """Calculate perplexity from loss"""
-    return torch.exp(torch.tensor(loss)).item()
-
-def count_parameters(model):
-    """Count trainable parameters in the model"""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-def setup_wandb_logging(args, model):
-    """Set up improved WandB logging"""
-    # Create a more descriptive run name
-    if args.mode == "arithmetic":
-        run_name = f"arith_{args.operation}_{args.num_layers}L_{args.dim_model}d"
-    else:
-        run_name = f"tiny_{args.seq_len}seq_{args.num_layers}L_{args.dim_model}d"
-    
-    # Initialize wandb with improved config
-    wandb_run = wandb.init(
-        project="grokking-study",
-        name=run_name,
-        config=args,
-        reinit=True
-    )
-    
-    # Add model architecture details to config
-    wandb_run.config.update({
-        "model_parameters": count_parameters(model),
-        "model_type": "Transformer",
-        "model_structure": f"{args.num_layers}L_{args.dim_model}d_{args.num_heads}h"
-    })
-    
-    # Define metrics with consistent step tracking
-    wandb.define_metric("step")
-    wandb.define_metric("epoch")
-    
-    # Training metrics
-    wandb.define_metric("training/loss", step_metric="step")
-    wandb.define_metric("training/accuracy", step_metric="step")
-    wandb.define_metric("training/perplexity", step_metric="step")
-    wandb.define_metric("training/tokens_per_sec", step_metric="step")
-    
-    # Validation metrics
-    wandb.define_metric("validation/loss", step_metric="step")
-    wandb.define_metric("validation/accuracy", step_metric="step")
-    wandb.define_metric("validation/perplexity", step_metric="step")
-    
-    # Learning rate
-    wandb.define_metric("learning_rate", step_metric="step")
-    
-    # Timing metrics
-    wandb.define_metric("time/epoch_duration_sec", step_metric="epoch")
-    wandb.define_metric("time/epoch_samples", step_metric="epoch")
-    
-    # Resource usage
-    wandb.define_metric("resources/gpu_utilization", step_metric="step")
-    
-    return wandb_run
-
-def get_gpu_memory_usage():
-    """Get GPU memory usage if available"""
-    try:
-        gpu_memory_used = torch.cuda.max_memory_allocated() / (1024 ** 3)  # Convert to GB
-        return gpu_memory_used
-    except:
-        return 0
-
 def main(args):
-    # Set random seeds for reproducibility
+    wandb.init(project="grokking-study", config=args)
+    config = wandb.config
+    device = torch.device(config.device)
+    
     torch.manual_seed(42)
     np.random.seed(42)
     random.seed(42)
     
-    # Parse device setting
-    device = torch.device(args.device)
+    wandb.define_metric("step")
+    wandb.define_metric("epoch")
+    wandb.define_metric("cumulative_flops")
+    wandb.define_metric("training/accuracy", step_metric='step')
+    wandb.define_metric("training/loss", step_metric='cumulative_flops')
+    wandb.define_metric("validation/accuracy", step_metric='cumulative_flops')
+    wandb.define_metric("validation/loss", step_metric='cumulative_flops')
     
     # Load data based on mode
-    if args.mode == "arithmetic":
+    if config.mode == "arithmetic":
         train_loader, val_loader = get_data(
-            args.operation,
-            args.prime,
-            args.training_fraction,
-            args.batch_size
+            config.operation,
+            config.prime,
+            config.training_fraction,
+            config.batch_size
         )
-        num_tokens = args.prime + 4  # Include special tokens
+        num_tokens = config.prime + 4  # Include special tokens
         seq_len = 6
         vocab = None
     else:  # tinystories
         train_loader, val_loader, vocab = get_tinystories_data(
-            args.data_path,
-            args.seq_len,
-            args.batch_size,
-            args.training_fraction
+            config.data_path,
+            config.seq_len,
+            config.batch_size,
+            config.training_fraction
         )
         num_tokens = len(vocab)
-        seq_len = args.seq_len
+        seq_len = config.seq_len
     
-    # Create model
     model = Transformer(
-        num_layers=args.num_layers,
-        dim_model=args.dim_model,
-        num_heads=args.num_heads,
+        num_layers=config.num_layers,
+        dim_model=config.dim_model,
+        num_heads=config.num_heads,
         num_tokens=num_tokens,
         seq_len=seq_len,
         dropout=0.1
     ).to(device)
-    
-    # Initialize wandb
-    wandb_run = setup_wandb_logging(args, model)
-    
-    # Use gradient checkpointing for larger models if requested
-    if hasattr(args, 'use_gradient_checkpointing') and args.use_gradient_checkpointing:
-        model.use_gradient_checkpointing()
-    
+
     # Handle inference-only mode
     if args.inference_only and args.model_path:
         model.load_state_dict(torch.load(args.model_path))
         
-        if args.mode == "arithmetic":
-            inference_demo(model, args.prime, device, args.operation)
+        if config.mode == "arithmetic":
+            inference_demo(model, config.prime, device, config.operation)
         else:  # tinystories
             # Load vocabulary
             vocab_path = args.model_path.replace(".pt", "_vocab.json")
@@ -261,167 +180,86 @@ def main(args):
                 text = generate_text(model, vocab, device, seed_text=seed, max_len=200)
                 print(f"Generated: {text}")
                 print("-" * 50)
-            
-            # Log samples to wandb
-            log_text_samples(model, vocab, device, seeds, wandb_run, 0)
         
-        wandb.finish()
         return
 
     # Estimate FLOPs
-    sample_input = torch.randint(0, num_tokens, (args.batch_size, seq_len)).to(device)
+    sample_input = torch.randint(0, num_tokens, (config.batch_size, seq_len)).to(device)
     try:
         flops, _ = profile(model, inputs=(sample_input,))
         flops_per_step = 2 * flops
-        wandb.run.summary["model/flops_per_forward"] = flops
     except Exception as e:
         print(f"Error calculating FLOPs: {e}")
         n = seq_len
-        d = args.dim_model
+        d = config.dim_model
         flops_per_layer = 2 * n**2 * d + 2 * n * d**2
-        total_flops = flops_per_layer * args.num_layers
+        total_flops = flops_per_layer * config.num_layers
         flops_per_step = 2 * total_flops
     
-    # Log model architecture as config
-    model_config = {
-        "num_layers": args.num_layers,
-        "dim_model": args.dim_model,
-        "num_heads": args.num_heads,
-        "num_tokens": num_tokens,
-        "seq_len": seq_len,
-        "trainable_params": count_parameters(model)
-    }
-    wandb.config.update({"model_details": model_config})
+    cumulative_flops = 0
     
-    # Optimizer setup
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=args.learning_rate,
+        lr=config.learning_rate,
         betas=(0.9, 0.98),
         eps=1e-8,
-        weight_decay=args.weight_decay
+        weight_decay=config.weight_decay
     )
     
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
     scaler = GradScaler()
     
-    num_epochs = ceil(args.num_steps / len(train_loader))
+    num_epochs = ceil(config.num_steps / len(train_loader))
     
-    # Create seed texts for periodic sample generation (for tinystories)
-    seed_texts = ["Once upon a time", "There was a", "The little", "In a small town"]
-    
-    # Training loop
-    global_step = 0
-    best_val_loss = float('inf')
-    
-    for epoch in tqdm(range(num_epochs), desc="Epochs"):
-        epoch_start_time = time.time()
-        
-        # Train for one epoch
-        global_step = train_epoch(
+    for epoch in tqdm(range(num_epochs)):
+        cumulative_flops = train_epoch(
             model, train_loader, optimizer, scheduler, 
-            scaler, device, args.num_steps, epoch, 
-            global_step, args.mode, wandb_run, vocab
+            scaler, device, config.num_steps, epoch, 
+            flops_per_step, cumulative_flops, config.mode
         )
-        
-        # Evaluate
-        val_metrics = evaluate(
-            model, val_loader, device, epoch, 
-            global_step, args.mode, wandb_run
-        )
-        
-        # Calculate epoch statistics
-        epoch_duration = time.time() - epoch_start_time
-        samples_processed = len(train_loader) * args.batch_size
-        
-        epoch_metrics = {
-            "epoch": epoch,
-            "time/epoch_duration_sec": epoch_duration,
-            "time/epoch_samples": samples_processed,
-            "time/samples_per_sec": samples_processed / epoch_duration
-        }
-        wandb_run.log(epoch_metrics, step=global_step)
-        
-        # Generate and log text samples (for tinystories)
-        if args.mode == "tinystories" and epoch % 5 == 0:
-            samples = log_text_samples(
-                model, vocab, device, seed_texts, 
-                wandb_run, global_step
-            )
-            print("\nSample generation at epoch", epoch)
-            for key, sample in list(samples.items())[:2]:  # Print first two samples
-                print(f"{sample}\n---")
-        
-        # Save model if validation improves
-        if val_metrics["validation/loss"] < best_val_loss:
-            best_val_loss = val_metrics["validation/loss"]
-            checkpoint_path = f"model_{args.mode}_best.pt"
-            torch.save(model.state_dict(), checkpoint_path)
-            wandb_run.summary["best_val_loss"] = best_val_loss
-            wandb_run.summary["best_epoch"] = epoch
-        
-        # Periodic checkpoint
-        if epoch % 10 == 0 and epoch > 0:
-            checkpoint_path = f"model_{args.mode}_epoch{epoch}.pt"
-            torch.save(model.state_dict(), checkpoint_path)
-            
-            if args.mode == "tinystories":
-                # Save vocabulary
-                vocab_path = checkpoint_path.replace(".pt", "_vocab.json")
-                with open(vocab_path, 'w') as f:
-                    json.dump(vocab, f)
+        evaluate(model, val_loader, device, epoch, cumulative_flops, config.mode)
     
-    # Save final model
-    if args.mode == "arithmetic":
-        model_path = f"model_{args.operation}_{args.prime}.pt"
+    # Save model and perform inference demo
+    if config.mode == "arithmetic":
+        model_path = f"model_{config.operation}_{config.prime}.pt"
         torch.save(model.state_dict(), model_path)
+        print(f"\nModel saved to {model_path}")
         
         print("\nRunning inference demo...")
-        inference_demo(model, args.prime, device, args.operation)
+        inference_demo(model, config.prime, device, config.operation)
     else:  # tinystories
-        model_path = f"model_tinystories_{args.seq_len}.pt"
+        model_path = f"model_tinystories_{config.seq_len}.pt"
         torch.save(model.state_dict(), model_path)
         
         # Save vocabulary
-        vocab_path = f"model_tinystories_{args.seq_len}_vocab.json"
+        vocab_path = f"model_tinystories_{config.seq_len}_vocab.json"
         with open(vocab_path, 'w') as f:
             json.dump(vocab, f)
+        
+        print(f"\nModel saved to {model_path}")
+        print(f"Vocabulary saved to {vocab_path}")
         
         # Generate text samples
         print("\nGenerated Text Samples:")
         print("-" * 50)
-        for seed in seed_texts:
+        seeds = ["Once upon a time", "There was a", "The little", "In a small town"]
+        for seed in seeds:
             print(f"Seed: {seed}")
             text = generate_text(model, vocab, device, seed_text=seed, max_len=200)
             print(f"Generated: {text}")
             print("-" * 50)
-    
-    wandb_run.finish()
-    print(f"\nModel saved to {model_path}")
 
 def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, 
-                num_steps, epoch, global_step, mode, wandb_run, vocab=None):
-    """Train for one epoch with improved logging"""
+                num_steps, epoch, flops_per_step, cumulative_flops, mode="arithmetic"):
     model.train()
     criterion = torch.nn.CrossEntropyLoss()
     
-    epoch_loss = 0
-    epoch_correct = 0
-    epoch_total = 0
-    epoch_start_time = time.time()
-    batch_start_time = time.time()
-    
     for batch_idx, batch in enumerate(train_loader):
-        step_start_time = time.time()
-        
-        # Move data to device
         batch = tuple(t.to(device) for t in batch)
         inputs, targets = batch
         
-        # Clear gradients
         optimizer.zero_grad(set_to_none=True)
         
-        # Forward pass with autocast for mixed precision
         with autocast():
             outputs = model(inputs)
             
@@ -430,17 +268,16 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device,
                 output = outputs[-1,:,:]
                 loss = criterion(output, targets)
                 with torch.no_grad():
-                    preds = torch.argmax(output, dim=1)
-                    correct = (preds == targets).sum().item()
-                    total = targets.size(0)
+                    acc = (torch.argmax(output, dim=1) == targets).float().mean()
             else:  # tinystories
-                # For text, align predictions with targets
+                # For text, we need to align the predictions with targets
+                # First, reshape targets
                 batch_size, seq_len = targets.shape
                 
                 # Reshape outputs to [batch_size, seq_len, vocab_size]
                 outputs = outputs.permute(1, 0, 2)
                 
-                # Align outputs and targets
+                # We only need positions 0 to seq_len-1 from outputs to predict positions 1 to seq_len in targets
                 outputs = outputs[:, :-1, :]  # [batch_size, seq_len-1, vocab_size]
                 targets = targets[:, 1:]      # [batch_size, seq_len-1]
                 
@@ -452,10 +289,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device,
                 
                 with torch.no_grad():
                     preds = torch.argmax(outputs_flat, dim=1)
-                    correct = (preds == targets_flat).sum().item()
-                    total = targets_flat.size(0)
+                    acc = (preds == targets_flat).float().mean()
         
-        # Backward pass and optimization
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -463,78 +298,29 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device,
         scaler.update()
         scheduler.step()
         
-        # Accumulate statistics
-        epoch_loss += loss.item() * inputs.size(0)
-        epoch_correct += correct
-        epoch_total += total
-        
-        # Calculate performance metrics
-        accuracy = correct / total
-        perplexity = calculate_perplexity(loss.item())
-        
-        # Calculate tokens processed per second
-        batch_duration = time.time() - batch_start_time
-        tokens_per_sec = (inputs.size(0) * inputs.size(1)) / batch_duration
-        
-        # GPU utilization and memory stats
-        gpu_mem_used = get_gpu_memory_usage()
-        
-        # Log metrics
+        cumulative_flops += flops_per_step
         metrics = {
+            "training/accuracy": acc,
             "training/loss": loss.item(),
-            "training/accuracy": accuracy,
-            "training/perplexity": perplexity,
             "learning_rate": scheduler.get_last_lr()[0],
             "epoch": epoch,
-            "step": global_step,
-            "training/tokens_per_sec": tokens_per_sec,
-            "resources/gpu_memory_gb": gpu_mem_used,
+            "step": epoch * len(train_loader) + batch_idx,
+            "cumulative_flops": cumulative_flops
         }
+        wandb.log(metrics)
         
-        # Log at regular intervals to avoid flooding WandB
-        if batch_idx % 10 == 0 or batch_idx == len(train_loader) - 1:
-            wandb_run.log(metrics, step=global_step)
-        
-        # Periodic text generation for tinystories (every 1000 steps)
-        if mode == "tinystories" and global_step > 0 and global_step % 1000 == 0 and vocab is not None:
-            # Generate a single sample to track improvement
-            seed_text = "Once upon a time"
-            text = generate_text(model, vocab, device, seed_text=seed_text, max_len=100)
-            wandb_run.log({
-                "samples/text": wandb.Html(f"<h3>Step {global_step}</h3><p><b>Seed:</b> {seed_text}</p><p>{text}</p>")
-            }, step=global_step)
-        
-        global_step += 1
-        batch_start_time = time.time()
-        
-        # Exit if we've reached the maximum number of steps
-        if global_step >= num_steps:
-            break
+        if epoch * len(train_loader) + batch_idx >= num_steps:
+            return cumulative_flops
     
-    # Log epoch summary
-    epoch_accuracy = epoch_correct / epoch_total
-    epoch_avg_loss = epoch_loss / len(train_loader)
-    epoch_duration = time.time() - epoch_start_time
-    
-    epoch_summary = {
-        "training/epoch_loss": epoch_avg_loss,
-        "training/epoch_accuracy": epoch_accuracy,
-        "training/epoch_perplexity": calculate_perplexity(epoch_avg_loss),
-        "time/train_epoch_duration": epoch_duration
-    }
-    wandb_run.log(epoch_summary, step=global_step)
-    
-    return global_step
+    return cumulative_flops
 
-def evaluate(model, val_loader, device, epoch, global_step, mode, wandb_run):
-    """Evaluate model with improved logging"""
+def evaluate(model, val_loader, device, epoch, cumulative_flops, mode="arithmetic"):
     model.eval()
     criterion = torch.nn.CrossEntropyLoss()
     
     total_loss = 0
     correct = 0
     total = 0
-    eval_start_time = time.time()
     
     with torch.no_grad():
         for batch in val_loader:
@@ -574,20 +360,15 @@ def evaluate(model, val_loader, device, epoch, global_step, mode, wandb_run):
             
             total_loss += loss.item() * inputs.size(0)
     
-    # Calculate metrics
     avg_loss = total_loss / len(val_loader)
-    accuracy = correct / total if total > 0 else 0
-    perplexity = calculate_perplexity(avg_loss)
-    eval_duration = time.time() - eval_start_time
+    accuracy = correct / total
     
-    # Log validation metrics
     metrics = {
-        "validation/loss": avg_loss,
         "validation/accuracy": accuracy,
-        "validation/perplexity": perplexity,
-        "time/validation_duration": eval_duration,
+        "validation/loss": avg_loss,
+        "epoch": epoch,
+        "cumulative_flops": cumulative_flops
     }
+    wandb.log(metrics)
     
-    wandb_run.log(metrics, step=global_step)
-    
-    return metrics
+    return accuracy
