@@ -18,8 +18,9 @@ MULTIPLICATION_MODULO_OPERATIONS = {
 }
 
 ALL_MODULO_OPERATIONS = {
-    "x+y": lambda x, y, _: (x, y, x + y),
-    "x-y": lambda x, y, _: (x, y, x - y),
+    # Apply modulo to ensure results are within [0, p-1] range
+    "x+y": lambda x, y, p: (x, y, (x + y) % p),
+    "x-y": lambda x, y, p: (x, y, (x - y) % p),
     **DIVISION_MODULO_OPERATIONS,
     **MULTIPLICATION_MODULO_OPERATIONS,
 }
