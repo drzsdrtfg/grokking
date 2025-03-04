@@ -1,13 +1,65 @@
-from math import ceil
-import torch
 import os
 import json
+import torch
+from math import ceil
 import glob
 import random
 
 # Token constants
-BOS_TOKEN = -1  # Beginning of sequence token
-EOS_TOKEN = -2  # End of sequence token
+BOS_TOKEN = 133  # Beginning of sequence token
+EOS_TOKEN = 134  # End of sequence token
+PAD_TOKEN = 135  # Padding token
+
+# Define the shared vocabulary structure
+SHARED_VOCAB = {
+    # Tab, Newline, Space
+    '\t': 0, '\n': 1, ' ': 2,
+    
+    # Punctuation
+    '!': 3, '"': 4, '#': 5, '$': 6, '&': 7, "'": 8, '(': 9, ')': 10,
+    '*': 11, '+': 12, ',': 13, '-': 14, '.': 15, '/': 16,
+    
+    # Digits
+    '0': 17, '1': 18, '2': 19, '3': 20, '4': 21, 
+    '5': 22, '6': 23, '7': 24, '8': 25, '9': 26,
+    
+    # More punctuation
+    ':': 27, ';': 28, '<': 29, '=': 30, '>': 31, '?': 32,
+    
+    # Uppercase letters
+    'A': 33, 'B': 34, 'C': 35, 'D': 36, 'E': 37, 'F': 38, 'G': 39, 'H': 40,
+    'I': 41, 'J': 42, 'K': 43, 'L': 44, 'M': 45, 'N': 46, 'O': 47, 'P': 48,
+    'Q': 49, 'R': 50, 'S': 51, 'T': 52, 'U': 53, 'V': 54, 'W': 55, 'X': 56, 
+    'Y': 57, 'Z': 58,
+    
+    # More punctuation
+    '[': 59, '\\': 60, ']': 61, '_': 62, '`': 63,
+    
+    # Lowercase letters
+    'a': 64, 'b': 65, 'c': 66, 'd': 67, 'e': 68, 'f': 69, 'g': 70, 'h': 71,
+    'i': 72, 'j': 73, 'k': 74, 'l': 75, 'm': 76, 'n': 77, 'o': 78, 'p': 79,
+    'q': 80, 'r': 81, 's': 82, 't': 83, 'u': 84, 'v': 85, 'w': 86, 'x': 87,
+    'y': 88, 'z': 89,
+    
+    # Other characters and special tokens
+    '~': 90, '\x92': 91, '\xa0': 92, '§': 93, '\xad': 94, '´': 95, '·': 96,
+    'é': 97, 'í': 98, 'ï': 99, 'ñ': 100, 'ö': 101, 'İ': 102, 'ɪ': 103, 'ʏ': 104,
+    'ʙ': 105, 'ʜ': 106, 'ғ': 107, 'ᴀ': 108, 'ᴄ': 109, 'ᴅ': 110, 'ᴇ': 111, 'ᴏ': 112,
+    'ᴛ': 113, 'ᴜ': 114, 'ᴡ': 115, 'ᴢ': 116, '\u2005': 117, '\u2009': 118, '\u200a': 119,
+    '\u200b': 120, '‑': 121, '–': 122, '—': 123, '―': 124, ''': 125, ''': 126, '"': 127,
+    '"': 128, '„': 129, '…': 130, '\u2028': 131, '\u3000': 132,
+    
+    # Special tokens
+    '<bos>': BOS_TOKEN,
+    '<eos>': EOS_TOKEN,
+    '<pad>': PAD_TOKEN
+}
+
+# Create reverse mapping
+SHARED_VOCAB_REVERSE = {v: k for k, v in SHARED_VOCAB.items()}
+
+# Total vocabulary size including special tokens
+VOCAB_SIZE = len(SHARED_VOCAB)
 
 DIVISION_MODULO_OPERATIONS = {
     "x/y": lambda x, y, p: (x*y % p, y, x),
@@ -29,43 +81,67 @@ ALL_OPERATIONS = {
     **ALL_MODULO_OPERATIONS,
 }
 
-def operation_mod_p_data(operation: str, p: int, eq_token: int, op_token: int):
+def operation_mod_p_data(operation: str, p: int):
     """
-    Generate data for modular arithmetic operations with BOS and EOS tokens
+    Generate data for modular arithmetic operations with shared vocabulary tokens
     """
+    # Ensure p is not greater than our vocabulary size
+    assert p <= 128, f"Prime modulus must be <= 128, got {p}"
+    
+    # Generate all possible x, y pairs
     x = torch.arange(0, p)
     y = torch.arange(0 if operation not in DIVISION_MODULO_OPERATIONS else 1, p)
     x, y = torch.cartesian_prod(x, y).T
-
+    
+    # Map operators and symbols to vocab tokens
+    op_str = operation[1]  # Extract operation symbol (*, +, -, /)
+    op_token = SHARED_VOCAB.get(op_str, SHARED_VOCAB['*'])  # Default to * if not found
+    eq_token = SHARED_VOCAB['=']
+    
     eq = torch.ones_like(x) * eq_token
     op = torch.ones_like(x) * op_token
     
     # Add BOS and EOS tokens
-    bos = torch.ones_like(x) * (p + 2)  # BOS token
-    eos = torch.ones_like(x) * (p + 3)  # EOS token
-
-    x, y, labels = ALL_OPERATIONS[operation](x, y, p)
-
+    bos = torch.ones_like(x) * BOS_TOKEN
+    eos = torch.ones_like(x) * EOS_TOKEN
+    
+    # Generate labels
+    x_vals, y_vals, labels = ALL_OPERATIONS[operation](x, y, p)
+    
     # Stack with BOS at start and EOS at end
-    inputs = torch.stack([bos, x, op, y, eq, eos], dim=1)
-
+    inputs = torch.stack([bos, x_vals, op, y_vals, eq, eos], dim=1)
+    
     return inputs, labels
 
 def get_data(operation: str, prime: int, training_fraction: float, batch_size: int):
-    inputs, labels = operation_mod_p_data(operation, prime, prime, prime+1)
+    """Get data for arithmetic operations using shared vocabulary"""
+    inputs, labels = operation_mod_p_data(operation, prime)
     dataset = torch.utils.data.TensorDataset(inputs, labels)
-
+    
     train_size = int(training_fraction * len(dataset))
     val_size = len(dataset) - train_size
-
+    
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-
+    
     batch_size = min(batch_size, ceil(len(dataset) / 2))
-
+    
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
-
+    
     return train_loader, val_loader
+
+def load_shared_vocab(vocab_path=None):
+    """
+    Load the shared vocabulary or create it if it doesn't exist
+    """
+    if vocab_path and os.path.exists(vocab_path):
+        try:
+            with open(vocab_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            print(f"Error loading vocabulary from {vocab_path}, using default")
+    
+    return SHARED_VOCAB
 
 # TinyStories functions
 def load_tinystories(data_path: str, min_length: int = 50):
@@ -220,29 +296,10 @@ def create_sample_stories(num_stories=10):
     
     return stories
 
-def create_char_vocab(stories):
-    """Create character-level vocabulary"""
-    chars = set()
-    for story in stories:
-        chars.update(story)
-    
-    # Sort for deterministic ordering
-    chars = sorted(list(chars))
-    
-    # Create vocabulary (char -> id)
-    vocab = {char: i for i, char in enumerate(chars)}
-    
-    # Add special tokens
-    vocab['<bos>'] = len(vocab)  # Beginning of sequence
-    vocab['<eos>'] = len(vocab)  # End of sequence
-    vocab['<pad>'] = len(vocab)  # Padding
-    
-    return vocab
-
 def tokenize_story(story, vocab, seq_len):
-    """Tokenize a story at character level"""
-    # Convert to character tokens
-    tokens = [vocab[c] for c in story if c in vocab]
+    """Tokenize a story using the shared vocabulary"""
+    # Convert to character tokens, replacing unknown chars with space
+    tokens = [vocab.get(c, vocab[' ']) for c in story]
     
     # Create sequences of length seq_len + 1 (input + target)
     sequences = []
@@ -270,7 +327,7 @@ def tokenize_story(story, vocab, seq_len):
     return sequences, targets
 
 def get_tinystories_data(data_path, seq_len, batch_size, training_fraction=0.9):
-    """Get data loaders for TinyStories dataset"""
+    """Get data loaders for TinyStories dataset with shared vocabulary"""
     print(f"Loading TinyStories data from {data_path}...")
     stories = load_tinystories(data_path)
     
@@ -279,9 +336,11 @@ def get_tinystories_data(data_path, seq_len, batch_size, training_fraction=0.9):
         # Create synthetic stories as fallback
         stories = create_sample_stories(20)
     
-    print(f"Creating vocabulary from {len(stories)} stories...")
-    vocab = create_char_vocab(stories)
-    print(f"Vocabulary size: {len(vocab)} characters")
+    # Load or use default shared vocabulary
+    vocab_path = os.path.join(os.path.dirname(data_path), "vocabulary.json")
+    vocab = load_shared_vocab(vocab_path)
+    
+    print(f"Using shared vocabulary with {len(vocab)} tokens")
     
     all_sequences = []
     all_targets = []
