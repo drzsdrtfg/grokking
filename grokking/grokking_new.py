@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run multiple grokking experiments")
     parser.add_argument("--experiment_type", type=str, choices=["weight_decay", "learning_rate", "model_size", "training_ratio", "all", "baseline"],
                       default="all", help="Type of experiment to run")
-    parser.add_argument("--runs", type=int, default=3, help="Number of runs per experiment")
+    parser.add_argument("--runs", type=int, default=1, help="Number of runs per experiment")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda or cpu)")
     parser.add_argument("--random_order", action="store_true", help="Run experiments in random order")
     
@@ -25,7 +25,7 @@ def main():
         "python", "cli.py",
         "--operation", "x*y",
         "--prime", "97",
-        "--num_steps", "55000",
+        "--num_steps", "50000",
         "--device", args.device
     ]
     
@@ -50,7 +50,7 @@ def main():
     
     # Weight decay experiment
     if args.experiment_type in ["weight_decay", "all"]:
-        values = [0.1, 0.5, 1.0, 10.0]
+        values = [0.5, 2.0]
         for val in values:
             params = baseline_params.copy()
             params["weight_decay"] = val
@@ -61,7 +61,7 @@ def main():
     
     # Learning rate experiment
     if args.experiment_type in ["learning_rate", "all"]:
-        values = [1e-4, 5e-4, 1e-3, 5e-3]
+        values = [5e-4, 5e-3]
         for val in values:
             params = baseline_params.copy()
             params["learning_rate"] = val
@@ -73,9 +73,7 @@ def main():
     # Model size experiment
     if args.experiment_type in ["model_size", "all"]:
         sizes = [
-            (64, 1),    # Extra Small
-            (128, 2),   # Small
-            (256, 4),   # Medium
+            (128, 2),   # Small   # Medium
             (512, 6),   # Large
         ]
         for dim_model, num_layers in sizes:
@@ -89,7 +87,7 @@ def main():
     
     # Training ratio experiment
     if args.experiment_type in ["training_ratio", "all"]:
-        values = [0.05, 0.1, 0.2, 0.5]
+        values = [0.1, 0.5]
         for val in values:
             params = baseline_params.copy()
             params["training_fraction"] = val
