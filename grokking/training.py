@@ -7,6 +7,7 @@ import numpy as np
 import os
 import json
 import random
+import itertools
 from data import get_data, get_tinystories_data, ALL_OPERATIONS, DIVISION_MODULO_OPERATIONS
 from data import SHARED_VOCAB, SHARED_VOCAB_REVERSE, VOCAB_SIZE, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN
 from model import Transformer
@@ -119,7 +120,25 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device,
     model.train()
     criterion = torch.nn.CrossEntropyLoss()
     
-    for batch_idx, batch in enumerate(train_loader):
+    # Calculate the global step at the beginning of the epoch
+    global_step = epoch * len(train_loader)
+    
+    # Only process batches until we reach the step limit
+    max_batches = min(len(train_loader), num_steps - global_step)
+    
+    if max_batches <= 0:
+        return cumulative_flops  # Return early if we've already reached the step limit
+    
+    # Use a progress bar for better monitoring
+    pbar = tqdm(itertools.islice(train_loader, max_batches), total=max_batches, 
+                desc=f"Epoch {epoch+1}", leave=False)
+    
+    for batch_idx, batch in enumerate(pbar):
+        # Check if we've reached the step limit
+        current_step = global_step + batch_idx
+        if current_step >= num_steps:
+            break
+            
         batch = tuple(t.to(device) for t in batch)
         inputs, targets = batch
         
@@ -169,17 +188,21 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device,
             "training/loss": loss.item(),
             "learning_rate": scheduler.get_last_lr()[0],
             "epoch": epoch,
-            "step": epoch * len(train_loader) + batch_idx,
+            "step": current_step,
             "cumulative_flops": cumulative_flops
         }
         wandb.log(metrics)
         
-        if epoch * len(train_loader) + batch_idx >= num_steps:
-            return cumulative_flops
+        # Update progress bar
+        pbar.set_postfix({
+            "loss": f"{loss.item():.4f}", 
+            "acc": f"{acc.item():.4f}", 
+            "step": current_step
+        })
     
     return cumulative_flops
 
-def evaluate(model, val_loader, device, epoch, cumulative_flops, mode="arithmetic"):
+def evaluate(model, val_loader, device, epoch, cumulative_flops, mode="arithmetic", max_eval_batches=100):
     model.eval()
     criterion = torch.nn.CrossEntropyLoss()
     
@@ -187,8 +210,11 @@ def evaluate(model, val_loader, device, epoch, cumulative_flops, mode="arithmeti
     correct = 0
     total = 0
     
+    # Limit validation to a reasonable number of batches to save time
+    val_batches = list(itertools.islice(val_loader, max_eval_batches))
+    
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in tqdm(val_batches, desc="Validating", leave=False):
             batch = tuple(t.to(device) for t in batch)
             inputs, targets = batch
             
@@ -225,8 +251,10 @@ def evaluate(model, val_loader, device, epoch, cumulative_flops, mode="arithmeti
             
             total_loss += loss.item() * inputs.size(0)
     
-    avg_loss = total_loss / len(val_loader)
-    accuracy = correct / total
+    avg_loss = total_loss / len(val_batches) if val_batches else 0
+    accuracy = correct / total if total > 0 else 0
+    
+    print(f"Validation - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
     
     metrics = {
         "validation/accuracy": accuracy,
@@ -336,17 +364,74 @@ def main(args):
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
     scaler = GradScaler()
     
-    num_epochs = ceil(config.num_steps / len(train_loader))
+    # Calculate how many steps per epoch
+    steps_per_epoch = len(train_loader)
     
-    for epoch in tqdm(range(num_epochs)):
+    # Calculate how many epochs we need
+    # Add 1 to ensure we don't stop early due to rounding
+    num_epochs = min(1000, ceil(config.num_steps / steps_per_epoch) + 1)
+    
+    # Print information about the training setup
+    print(f"Training setup:")
+    print(f"- Total steps: {config.num_steps}")
+    print(f"- Steps per epoch: {steps_per_epoch}")
+    print(f"- Number of epochs: {num_epochs}")
+    print(f"- Batch size: {config.batch_size}")
+    
+    # Early stopping variables
+    best_val_acc = 0
+    patience = 3
+    patience_counter = 0
+    
+    # Keep track of total steps to make sure we don't exceed the limit
+    total_steps = 0
+    
+    for epoch in range(num_epochs):
+        # Break if we've reached the step limit
+        if total_steps >= config.num_steps:
+            print(f"Reached step limit ({config.num_steps}). Stopping training.")
+            break
+            
+        # Calculate steps remaining
+        steps_remaining = config.num_steps - total_steps
+        
+        print(f"\nEpoch {epoch+1}/{num_epochs} - Steps remaining: {steps_remaining}")
+        
         cumulative_flops = train_epoch(
             model, train_loader, optimizer, scheduler, 
             scaler, device, config.num_steps, epoch, 
             flops_per_step, cumulative_flops, config.mode
         )
-        evaluate(model, val_loader, device, epoch, cumulative_flops, config.mode)
+        
+        # Update step count 
+        total_steps = min((epoch + 1) * steps_per_epoch, config.num_steps)
+        
+        # Evaluate
+        val_acc = evaluate(model, val_loader, device, epoch, cumulative_flops, config.mode)
+        
+        # Save best model
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            # Save best model
+            if config.mode == "arithmetic":
+                best_model_path = f"best_model_{config.operation}_{config.prime}.pt"
+            else:
+                best_model_path = f"best_model_tinystories_{config.seq_len}.pt"
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best model saved with validation accuracy: {val_acc:.4f}")
+        else:
+            patience_counter += 1
+            print(f"Validation accuracy did not improve. Patience: {patience_counter}/{patience}")
+            
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs")
+            # Load the best model before final evaluation
+            model.load_state_dict(torch.load(best_model_path))
+            break
     
-    # Save model and perform inference demo
+    # Save final model and perform inference demo
     if config.mode == "arithmetic":
         model_path = f"model_{config.operation}_{config.prime}_shared.pt"
         torch.save(model.state_dict(), model_path)
