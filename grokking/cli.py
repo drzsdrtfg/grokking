@@ -1,6 +1,8 @@
 from argparse import ArgumentParser
 from data import ALL_OPERATIONS
 from training import main
+import os
+import json
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -11,7 +13,8 @@ if __name__ == "__main__":
     # Arithmetic operation arguments
     parser.add_argument("--operation", type=str, choices=ALL_OPERATIONS.keys(), default="x*y")
     parser.add_argument("--training_fraction", type=float, default=0.2)
-    parser.add_argument("--prime", type=int, default=97)
+    parser.add_argument("--prime", type=int, default=97,
+                       help="Prime modulus for arithmetic (must be <= 128 for shared vocab)")
     
     # TinyStories arguments
     parser.add_argument("--data_path", type=str, default=None, 
@@ -32,10 +35,14 @@ if __name__ == "__main__":
                     help="Run only inference using a saved model")
     parser.add_argument("--model_path", type=str, default=None,
                     help="Path to saved model for inference")
+    
     args = parser.parse_args()
     
     # Validate arguments
     if args.mode == "tinystories" and args.data_path is None:
         parser.error("--data_path is required when mode is tinystories")
+        
+    if args.prime > 128:
+        parser.error("Prime modulus must be <= 128 for shared vocabulary implementation")
 
     main(args)

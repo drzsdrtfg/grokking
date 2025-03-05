@@ -41,8 +41,13 @@ class Transformer(torch.nn.Module):
         
         self.num_tokens = num_tokens + 2  # Add BOS and EOS tokens
         
+        # Store the original sequence length
+        self.seq_len = seq_len
+        
+        # For position embeddings, support the maximum needed
+        # This allows us to handle variable sequence lengths without changing architecture
+        self.position_embeddings = nn.Embedding(max(seq_len, 128) + 2, dim_model)
         self.token_embeddings = nn.Embedding(self.num_tokens, dim_model)
-        self.position_embeddings = nn.Embedding(seq_len + 2, dim_model)
         
         nn.init.normal_(self.token_embeddings.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.position_embeddings.weight, mean=0.0, std=0.02)
@@ -60,6 +65,11 @@ class Transformer(torch.nn.Module):
 
     def forward(self, inputs: Tensor):
         batch_size, context_len = inputs.shape
+        
+        # Never exceed position embedding capacity
+        context_len = min(context_len, self.position_embeddings.weight.size(0))
+        if inputs.shape[1] > context_len:
+            inputs = inputs[:, :context_len]
         
         token_embedding = self.token_embeddings(inputs)
         positions = torch.arange(context_len, device=inputs.device)
